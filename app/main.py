@@ -8,6 +8,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
@@ -19,10 +20,16 @@ app = FastAPI(title="RAUC Simple Server", version="1.0.0")
 DATA_DIR = Path(os.environ.get('DATA_DIR', '/data'))
 BUNDLES_DIR = DATA_DIR / 'bundles'
 SERVER_URL = os.environ.get('SERVER_URL', 'https://localhost:8443')
-COMPATIBLE = os.environ.get('COMPATIBLE', 'iot-gateway-raspberrypi5')
+DEFAULT_COMPATIBLE = os.environ.get(
+    'DEFAULT_COMPATIBLE',
+    os.environ.get('COMPATIBLE', 'iot-gateway-raspberrypi5'),
+)
+MANIFESTS_DIR = DATA_DIR / 'manifests'
+LEGACY_MANIFEST_FILE = DATA_DIR / 'manifest.json'
 
 # Ensure directories exist
 BUNDLES_DIR.mkdir(parents=True, exist_ok=True)
+MANIFESTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Static files
 STATIC_DIR = Path('/app/static')
@@ -39,31 +46,72 @@ def require_mtls(request: Request) -> None:
         raise HTTPException(status_code=403, detail='mTLS client certificate required')
 
 
-def get_manifest() -> dict:
-    """Get current manifest from file or return empty state."""
-    manifest_file = DATA_DIR / 'manifest.json'
-    if manifest_file.exists():
-        return json.loads(manifest_file.read_text())
+def normalize_compatible(compatible: Optional[str]) -> str:
+    """Normalize compatible string into a safe, stable identifier."""
+    if not compatible:
+        return DEFAULT_COMPATIBLE
+    cleaned = ''.join(c if c.isalnum() or c in '._-' else '-' for c in compatible.strip())
+    return cleaned or DEFAULT_COMPATIBLE
 
-    # Auto-detect latest bundle if no manifest
+
+def manifest_path_for(compatible: str) -> Path:
+    """Return manifest path for the requested compatible."""
+    return MANIFESTS_DIR / f'{normalize_compatible(compatible)}.json'
+
+
+def manifest_bundle_url(filename: str) -> str:
+    """Build externally reachable bundle URL."""
+    return f'{SERVER_URL}/bundles/{quote(filename)}'
+
+
+def get_requested_compatible(request: Request) -> str:
+    """Resolve compatible from query/header and fallback to default."""
+    query_compatible = request.query_params.get('compatible')
+    header_compatible = request.headers.get('X-RAUC-Compatible')
+    return normalize_compatible(query_compatible or header_compatible or DEFAULT_COMPATIBLE)
+
+
+def auto_manifest(compatible: str) -> dict:
+    """Auto-detect latest bundle for compatible if no manifest exists."""
     bundles = sorted(BUNDLES_DIR.glob('*.raucb'), key=lambda p: p.stat().st_mtime, reverse=True)
     if bundles:
         bundle = bundles[0]
         return {
-            'bundle_url': f'{SERVER_URL}/bundles/{bundle.name}',
-            'compatible': COMPATIBLE,
+            'bundle_url': manifest_bundle_url(bundle.name),
+            'compatible': compatible,
             'filename': bundle.name,
             'size': bundle.stat().st_size,
             'sha256': hash_file(bundle),
             'released_at': datetime.fromtimestamp(bundle.stat().st_mtime).isoformat(),
         }
+    return {'bundle_url': '', 'compatible': compatible, 'filename': ''}
 
-    return {'bundle_url': '', 'compatible': COMPATIBLE, 'filename': ''}
+
+def get_manifest(compatible: Optional[str] = None) -> dict:
+    """Get manifest by compatible from file, legacy file, or auto state."""
+    resolved_compatible = normalize_compatible(compatible)
+    manifest_file = manifest_path_for(resolved_compatible)
+    if manifest_file.exists():
+        return json.loads(manifest_file.read_text())
+
+    if resolved_compatible == DEFAULT_COMPATIBLE and LEGACY_MANIFEST_FILE.exists():
+        legacy_manifest = json.loads(LEGACY_MANIFEST_FILE.read_text())
+        legacy_manifest['compatible'] = resolved_compatible
+        return legacy_manifest
+
+    if resolved_compatible == DEFAULT_COMPATIBLE:
+        return auto_manifest(resolved_compatible)
+
+    return {'bundle_url': '', 'compatible': resolved_compatible, 'filename': ''}
 
 
-def save_manifest(manifest: dict) -> None:
-    """Save manifest to file."""
-    (DATA_DIR / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+def save_manifest(manifest: dict, compatible: str) -> None:
+    """Save compatible-specific manifest to file."""
+    resolved_compatible = normalize_compatible(compatible)
+    manifest['compatible'] = resolved_compatible
+    manifest_path_for(resolved_compatible).write_text(json.dumps(manifest, indent=2))
+    if resolved_compatible == DEFAULT_COMPATIBLE:
+        LEGACY_MANIFEST_FILE.write_text(json.dumps(manifest, indent=2))
 
 
 def secure_filename(filename: str) -> str:
@@ -89,7 +137,15 @@ def hash_file(filepath: Path, chunk_size: int = 8192) -> str:
 async def api_manifest(request: Request):
     """Return update manifest for devices (mTLS required)."""
     require_mtls(request)
-    return get_manifest()
+    compatible = get_requested_compatible(request)
+    return get_manifest(compatible)
+
+
+@app.get('/api/v1/manifest/{compatible}.json')
+async def api_manifest_by_compatible(compatible: str, request: Request):
+    """Return update manifest for a specific compatible (mTLS required)."""
+    require_mtls(request)
+    return get_manifest(compatible)
 
 
 @app.get('/bundles/{filename}')
@@ -115,7 +171,32 @@ async def dashboard():
 @app.get('/api/manifest')
 async def api_manifest_dashboard():
     """Return manifest for dashboard."""
-    return get_manifest()
+    return get_manifest(DEFAULT_COMPATIBLE)
+
+
+@app.get('/api/manifests')
+async def api_manifests():
+    """List all known manifests by compatible."""
+    manifests = []
+    seen = set()
+
+    # Always include default/legacy view.
+    default_manifest = get_manifest(DEFAULT_COMPATIBLE)
+    if default_manifest.get('filename'):
+        manifests.append(default_manifest)
+        seen.add(default_manifest.get('compatible'))
+
+    for mf in sorted(MANIFESTS_DIR.glob('*.json')):
+        try:
+            parsed = json.loads(mf.read_text())
+            compatible = parsed.get('compatible')
+            if compatible in seen:
+                continue
+            manifests.append(parsed)
+            seen.add(compatible)
+        except Exception:
+            continue
+    return manifests
 
 
 @app.get('/api/bundles')
@@ -132,7 +213,11 @@ async def api_bundles():
 
 
 @app.post('/upload')
-async def upload_bundle(bundle: UploadFile = File(...), activate: Optional[str] = Form(None)):
+async def upload_bundle(
+    bundle: UploadFile = File(...),
+    activate: Optional[str] = Form(None),
+    compatible: Optional[str] = Form(None),
+):
     """Upload a bundle."""
     if not bundle.filename:
         raise HTTPException(status_code=400, detail='No file selected')
@@ -150,52 +235,72 @@ async def upload_bundle(bundle: UploadFile = File(...), activate: Optional[str] 
             sha256.update(chunk)
 
     if activate == 'true':
-        save_manifest({
-            'bundle_url': f'{SERVER_URL}/bundles/{filename}',
-            'compatible': COMPATIBLE,
-            'filename': filename,
-            'size': filepath.stat().st_size,
-            'sha256': sha256.hexdigest(),
-            'released_at': datetime.now().isoformat(),
-        })
+        resolved_compatible = normalize_compatible(compatible or DEFAULT_COMPATIBLE)
+        save_manifest(
+            {
+                'bundle_url': manifest_bundle_url(filename),
+                'filename': filename,
+                'size': filepath.stat().st_size,
+                'sha256': sha256.hexdigest(),
+                'released_at': datetime.now().isoformat(),
+            },
+            compatible=resolved_compatible,
+        )
 
     return RedirectResponse(url='/', status_code=303)
 
 
 @app.post('/activate/{filename}')
-async def activate_bundle(filename: str):
+async def activate_bundle(filename: str, compatible: Optional[str] = None):
     """Set bundle as active."""
     safe_filename = secure_filename(filename)
     filepath = BUNDLES_DIR / safe_filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail='Bundle not found')
 
-    save_manifest({
-        'bundle_url': f'{SERVER_URL}/bundles/{safe_filename}',
-        'compatible': COMPATIBLE,
-        'filename': safe_filename,
-        'size': filepath.stat().st_size,
-        'sha256': hash_file(filepath),
-        'released_at': datetime.now().isoformat(),
-    })
+    save_manifest(
+        {
+            'bundle_url': manifest_bundle_url(safe_filename),
+            'filename': safe_filename,
+            'size': filepath.stat().st_size,
+            'sha256': hash_file(filepath),
+            'released_at': datetime.now().isoformat(),
+        },
+        compatible=compatible or DEFAULT_COMPATIBLE,
+    )
     return RedirectResponse(url='/', status_code=303)
 
 
+@app.post('/activate/{compatible}/{filename}')
+async def activate_bundle_for_compatible(compatible: str, filename: str):
+    """Set bundle as active for specific compatible."""
+    return await activate_bundle(filename=filename, compatible=compatible)
+
+
 @app.post('/delete/{filename}')
-async def delete_bundle(filename: str):
+async def delete_bundle(filename: str, compatible: Optional[str] = None):
     """Delete a bundle."""
     safe_filename = secure_filename(filename)
     filepath = BUNDLES_DIR / safe_filename
     if filepath.exists():
         filepath.unlink()
-        manifest_file = DATA_DIR / 'manifest.json'
+        resolved_compatible = normalize_compatible(compatible or DEFAULT_COMPATIBLE)
+        manifest_file = manifest_path_for(resolved_compatible)
         if manifest_file.exists():
             try:
                 if json.loads(manifest_file.read_text()).get('filename') == safe_filename:
                     manifest_file.unlink()
+                    if resolved_compatible == DEFAULT_COMPATIBLE and LEGACY_MANIFEST_FILE.exists():
+                        LEGACY_MANIFEST_FILE.unlink()
             except Exception:
                 pass
     return RedirectResponse(url='/', status_code=303)
+
+
+@app.post('/delete/{compatible}/{filename}')
+async def delete_bundle_for_compatible(compatible: str, filename: str):
+    """Delete bundle and clear manifest for specific compatible if active."""
+    return await delete_bundle(filename=filename, compatible=compatible)
 
 
 @app.get('/health')

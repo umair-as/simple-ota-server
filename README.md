@@ -20,7 +20,7 @@ cd simple-ota-server
 
 # Configure
 cp .env.example .env
-vim .env  # Set SERVER_URL and COMPATIBLE
+vim .env  # Set SERVER_URL and DEFAULT_COMPATIBLE
 
 # Generate certificates (DNS name + optional IP)
 ./scripts/generate-certs.sh certs ota-gw.local 192.168.0.193
@@ -62,8 +62,11 @@ Edit `.env`:
 # URL devices use to download bundles (must be reachable from devices)
 SERVER_URL=https://ota-gw.local:8443
 
-# RAUC compatible string (must match device's /etc/rauc/system.conf)
-COMPATIBLE=my-device-type
+# Default compatible used by dashboard actions and legacy clients
+DEFAULT_COMPATIBLE=iot-gateway-raspberrypi5
+
+# Backward-compatible alias still supported:
+# COMPATIBLE=iot-gateway-raspberrypi5
 ```
 
 ## Certificates
@@ -141,7 +144,7 @@ Devices poll the manifest endpoint:
 
 ```bash
 curl --cert device.crt --key device.key --cacert ca.crt \
-  https://ota-gw.local:8443/api/v1/manifest.json
+  "https://ota-gw.local:8443/api/v1/manifest.json?compatible=iot-gateway-raspberrypi5"
 ```
 
 Response:
@@ -170,18 +173,50 @@ Verify a remote bundle without installing:
 rauc info https://ota-gw.local:8443/bundles/update-1.2.0.raucb
 ```
 
+### Serving Multiple Machine Families
+
+Use one manifest per RAUC compatible and keep bundles in the same server:
+
+```bash
+# RPi5 rollout
+curl -X POST "http://127.0.0.1:8080/activate/rpi5-1.2.0.raucb?compatible=iot-gateway-raspberrypi5"
+
+# RZ/V2L rollout
+curl -X POST "http://127.0.0.1:8080/activate/rzv2l-1.2.0.raucb?compatible=rzv2l-dev"
+
+# VF2 rollout
+curl -X POST "http://127.0.0.1:8080/activate/vf2-1.2.0.raucb?compatible=visionfive2-dev"
+```
+
+Devices should poll their own compatible:
+
+```bash
+curl --cert device.crt --key device.key --cacert ca.crt \
+  "https://ota-gw.local:8443/api/v1/manifest.json?compatible=rzv2l-dev"
+```
+
+Alternative path form is also available:
+
+```bash
+https://ota-gw.local:8443/api/v1/manifest/rzv2l-dev.json
+```
+
 ## API Reference
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/` | GET | - | Dashboard |
 | `/api/v1/manifest.json` | GET | mTLS | Manifest for devices |
+| `/api/v1/manifest/{compatible}.json` | GET | mTLS | Manifest for a specific compatible |
 | `/api/manifest` | GET | - | Manifest for dashboard |
+| `/api/manifests` | GET | - | List all compatible manifests |
 | `/api/bundles` | GET | - | List bundles |
 | `/bundles/{name}` | GET | mTLS | Download bundle |
 | `/upload` | POST | - | Upload bundle |
 | `/activate/{name}` | POST | - | Activate bundle |
+| `/activate/{compatible}/{name}` | POST | - | Activate bundle for a compatible |
 | `/delete/{name}` | POST | - | Delete bundle |
+| `/delete/{compatible}/{name}` | POST | - | Delete bundle for a compatible |
 | `/health` | GET | - | Health check |
 
 ## License
