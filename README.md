@@ -4,18 +4,18 @@ A lightweight OTA update server for [RAUC](https://rauc.io) with mTLS device aut
 
 ## Features
 
-- **Web Dashboard** — Upload bundles, activate releases, drag-and-drop support
+- **Web Dashboard** — Upload bundles, activate/deactivate releases, drag-and-drop support
 - **mTLS Authentication** — Secure device-to-server communication with client certificates
 - **HTTP/2 Streaming** — Fast bundle downloads via RAUC's nbd streaming client
-- **REST API** — Simple JSON manifest for device polling
+- **Multi-board Support** — Per-compatible manifests for fleets with mixed hardware
+- **REST API** — Simple JSON manifest for device polling and CI/CD integration
 - **Docker Deployment** — Single `docker compose up` to run
-- **DNS-based Certs** — Stable TLS certificates that survive IP changes
 
 ## Quick Start
 
 ```bash
 # Clone the repo
-git clone https://github.com/umair-uas/simple-ota-server.git
+git clone https://github.com/umair-as/simple-ota-server.git
 cd simple-ota-server
 
 # Configure
@@ -62,12 +62,21 @@ Edit `.env`:
 # URL devices use to download bundles (must be reachable from devices)
 SERVER_URL=https://ota-gw.local:8443
 
-# Default compatible used by dashboard actions and legacy clients
-DEFAULT_COMPATIBLE=iot-gateway-raspberrypi5
-
-# Backward-compatible alias still supported:
-# COMPATIBLE=iot-gateway-raspberrypi5
+# Compatible string routed by the dashboard Activate button and legacy clients.
+# Must match the 'compatible' field in /etc/rauc/system.conf on your device.
+DEFAULT_COMPATIBLE=smarc-rzv2l
 ```
+
+## Dashboard
+
+The dashboard is a simple file manager for `.raucb` bundles:
+
+- **Upload** — drag-and-drop or click to browse; stores the file on the server
+- **Activate** — marks a bundle as the active release for `DEFAULT_COMPATIBLE`; devices polling the manifest endpoint will receive its URL
+- **Deactivate** — removes the active manifest; the file is kept on disk
+- **Delete** — removes the file and any associated manifest
+
+The dashboard does not manage compatible strings. The `DEFAULT_COMPATIBLE` set in `.env` is used automatically when the Activate button is clicked. For multi-board deployments, use the REST API directly (see CI/CD section below).
 
 ## Certificates
 
@@ -138,25 +147,31 @@ send-headers=boot-id;machine-id;transaction-id
 
 Copy `ca.crt`, `device.crt`, and `device.key` to the device's `/etc/ota/` directory.
 
-### Checking for updates
+### Polling for updates
 
-Devices poll the manifest endpoint:
+Devices poll the manifest endpoint, passing their compatible string:
 
 ```bash
 curl --cert device.crt --key device.key --cacert ca.crt \
-  "https://ota-gw.local:8443/api/v1/manifest.json?compatible=iot-gateway-raspberrypi5"
+  "https://ota-gw.local:8443/api/v1/manifest.json?compatible=smarc-rzv2l"
 ```
 
 Response:
 ```json
 {
   "bundle_url": "https://ota-gw.local:8443/bundles/update-1.2.0.raucb",
-  "compatible": "my-device-type",
+  "compatible": "smarc-rzv2l",
   "filename": "update-1.2.0.raucb",
   "size": 52428800,
   "sha256": "abc123...",
   "released_at": "2024-01-15T10:30:00"
 }
+```
+
+Alternative path form:
+
+```bash
+https://ota-gw.local:8443/api/v1/manifest/smarc-rzv2l.json
 ```
 
 ### Installing updates
@@ -167,57 +182,52 @@ RAUC streams the bundle directly over HTTP/2 using its nbd client:
 rauc install https://ota-gw.local:8443/bundles/update-1.2.0.raucb
 ```
 
-Verify a remote bundle without installing:
+## CI/CD Integration
+
+The server is format-agnostic — it does not parse bundle contents. The compatible string is supplied by the build system at upload time. In Yocto, `${MACHINE}` matches the RAUC compatible string in `system.conf`.
 
 ```bash
-rauc info https://ota-gw.local:8443/bundles/update-1.2.0.raucb
+# Upload and activate for a specific board (e.g. from a Yocto CI pipeline)
+curl -F "bundle=@fw-${MACHINE}.raucb" \
+     -F "compatible=${MACHINE}" \
+     -F "activate=true" \
+     http://127.0.0.1:8080/upload
+
+# Activate an already-uploaded bundle for a compatible
+curl -X POST "http://127.0.0.1:8080/activate/${MACHINE}/fw-${MACHINE}.raucb"
+
+# Deactivate without deleting the file
+curl -X POST "http://127.0.0.1:8080/deactivate/${MACHINE}"
 ```
 
-### Serving Multiple Machine Families
-
-Use one manifest per RAUC compatible and keep bundles in the same server:
+### Multi-board example
 
 ```bash
-# RPi5 rollout
-curl -X POST "http://127.0.0.1:8080/activate/rpi5-1.2.0.raucb?compatible=iot-gateway-raspberrypi5"
-
-# RZ/V2L rollout
-curl -X POST "http://127.0.0.1:8080/activate/rzv2l-1.2.0.raucb?compatible=rzv2l-dev"
-
-# VF2 rollout
-curl -X POST "http://127.0.0.1:8080/activate/vf2-1.2.0.raucb?compatible=visionfive2-dev"
+# Each board type gets its own manifest
+curl -X POST "http://127.0.0.1:8080/activate/smarc-rzv2l/rzv2l-1.2.0.raucb"
+curl -X POST "http://127.0.0.1:8080/activate/visionfive2/vf2-1.2.0.raucb"
+curl -X POST "http://127.0.0.1:8080/activate/iot-gateway-rpi5/rpi5-1.2.0.raucb"
 ```
 
-Devices should poll their own compatible:
-
-```bash
-curl --cert device.crt --key device.key --cacert ca.crt \
-  "https://ota-gw.local:8443/api/v1/manifest.json?compatible=rzv2l-dev"
-```
-
-Alternative path form is also available:
-
-```bash
-https://ota-gw.local:8443/api/v1/manifest/rzv2l-dev.json
-```
+Devices receive only the bundle matching their compatible string.
 
 ## API Reference
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/` | GET | - | Dashboard |
-| `/api/v1/manifest.json` | GET | mTLS | Manifest for devices |
+| `/` | GET | — | Dashboard |
+| `/api/v1/manifest.json` | GET | mTLS | Manifest for device (compatible via query or header) |
 | `/api/v1/manifest/{compatible}.json` | GET | mTLS | Manifest for a specific compatible |
-| `/api/manifest` | GET | - | Manifest for dashboard |
-| `/api/manifests` | GET | - | List all compatible manifests |
-| `/api/bundles` | GET | - | List bundles |
+| `/api/manifests` | GET | — | List all active manifests |
+| `/api/bundles` | GET | — | List all bundle files |
 | `/bundles/{name}` | GET | mTLS | Download bundle |
-| `/upload` | POST | - | Upload bundle |
-| `/activate/{name}` | POST | - | Activate bundle |
-| `/activate/{compatible}/{name}` | POST | - | Activate bundle for a compatible |
-| `/delete/{name}` | POST | - | Delete bundle |
-| `/delete/{compatible}/{name}` | POST | - | Delete bundle for a compatible |
-| `/health` | GET | - | Health check |
+| `/upload` | POST | — | Upload bundle (optionally activate with `compatible` + `activate=true`) |
+| `/activate/{name}` | POST | — | Activate bundle for `DEFAULT_COMPATIBLE` |
+| `/activate/{compatible}/{name}` | POST | — | Activate bundle for a specific compatible |
+| `/deactivate/{compatible}` | POST | — | Remove manifest for a compatible (keeps file) |
+| `/delete/{name}` | POST | — | Delete bundle |
+| `/delete/{compatible}/{name}` | POST | — | Delete bundle and clear its manifest for a compatible |
+| `/health` | GET | — | Health check |
 
 ## License
 

@@ -28,8 +28,8 @@ services:
     environment:
       - DATA_DIR=/data
       - SERVER_URL=${SERVER_URL:-https://ota-gw.local:8443}
-      - DEFAULT_COMPATIBLE=${DEFAULT_COMPATIBLE:-iot-gateway-raspberrypi5}
-      - COMPATIBLE=${COMPATIBLE:-iot-gateway-raspberrypi5}
+      - DEFAULT_COMPATIBLE=${DEFAULT_COMPATIBLE:-default}
+      - COMPATIBLE=${COMPATIBLE:-default}
     volumes:
       - ./data:/data
       - ./certs:/certs:ro

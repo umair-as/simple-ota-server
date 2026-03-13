@@ -22,7 +22,7 @@ BUNDLES_DIR = DATA_DIR / 'bundles'
 SERVER_URL = os.environ.get('SERVER_URL', 'https://localhost:8443')
 DEFAULT_COMPATIBLE = os.environ.get(
     'DEFAULT_COMPATIBLE',
-    os.environ.get('COMPATIBLE', 'iot-gateway-raspberrypi5'),
+    os.environ.get('COMPATIBLE', 'default'),
 )
 MANIFESTS_DIR = DATA_DIR / 'manifests'
 LEGACY_MANIFEST_FILE = DATA_DIR / 'manifest.json'
@@ -200,21 +200,19 @@ async def api_manifest_dashboard():
 
 @app.get('/api/manifests')
 async def api_manifests():
-    """List all known manifests by compatible."""
+    """List all manifests that have a bundle file present on disk."""
     manifests = []
     seen = set()
-
-    # Always include default/legacy view.
-    default_manifest = get_manifest(DEFAULT_COMPATIBLE)
-    if default_manifest.get('filename'):
-        manifests.append(default_manifest)
-        seen.add(default_manifest.get('compatible'))
 
     for mf in sorted(MANIFESTS_DIR.glob('*.json')):
         try:
             parsed = json.loads(mf.read_text())
             compatible = parsed.get('compatible')
+            filename = parsed.get('filename')
             if compatible in seen:
+                continue
+            # Skip orphaned manifests whose bundle file no longer exists.
+            if filename and not (BUNDLES_DIR / filename).exists():
                 continue
             manifests.append(parsed)
             seen.add(compatible)
@@ -259,7 +257,9 @@ async def upload_bundle(
             sha256.update(chunk)
 
     if activate == 'true':
-        resolved_compatible = normalize_compatible(compatible or DEFAULT_COMPATIBLE)
+        if not compatible or not compatible.strip():
+            raise HTTPException(status_code=400, detail='compatible is required when activating')
+        resolved_compatible = normalize_compatible(compatible)
         save_manifest(
             {
                 'bundle_url': manifest_bundle_url(filename),
@@ -299,6 +299,14 @@ async def activate_bundle(filename: str, compatible: Optional[str] = None):
 async def activate_bundle_for_compatible(compatible: str, filename: str):
     """Set bundle as active for specific compatible."""
     return await activate_bundle(filename=filename, compatible=compatible)
+
+
+@app.post('/deactivate/{compatible}')
+async def deactivate_compatible(compatible: str):
+    """Remove the active manifest for a compatible without deleting the bundle file."""
+    resolved = normalize_compatible(compatible)
+    manifest_path_for(resolved).unlink(missing_ok=True)
+    return RedirectResponse(url='/', status_code=303)
 
 
 @app.post('/delete/{filename}')
