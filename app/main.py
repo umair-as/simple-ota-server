@@ -26,6 +26,7 @@ DEFAULT_COMPATIBLE = os.environ.get(
 )
 MANIFESTS_DIR = DATA_DIR / 'manifests'
 LEGACY_MANIFEST_FILE = DATA_DIR / 'manifest.json'
+BOARDS_FILE = Path('/app/boards.json')
 
 # Ensure directories exist
 BUNDLES_DIR.mkdir(parents=True, exist_ok=True)
@@ -154,6 +155,52 @@ def any_manifest_references(filename: str) -> bool:
 
 
 # =============================================================================
+# Board registry helpers
+# =============================================================================
+
+def load_boards() -> dict:
+    """Load board registry {display_name: compatible} from boards.json."""
+    if not BOARDS_FILE.exists():
+        return {}
+    try:
+        return json.loads(BOARDS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def compatible_to_board_name(compatible: str) -> str:
+    """Reverse-lookup human display name from compatible string."""
+    for name, compat in load_boards().items():
+        if compat == compatible:
+            return name
+    return compatible
+
+
+def bundle_meta_path(filename: str) -> Path:
+    return BUNDLES_DIR / f'{filename}.meta.json'
+
+
+def read_bundle_meta(filename: str) -> Optional[dict]:
+    path = bundle_meta_path(filename)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def save_bundle_meta(filename: str, compatible: str) -> None:
+    """Save bundle metadata sidecar alongside the .raucb file."""
+    meta = {
+        'compatible': compatible,
+        'board_name': compatible_to_board_name(compatible),
+        'uploaded_at': datetime.now().isoformat(),
+    }
+    bundle_meta_path(filename).write_text(json.dumps(meta, indent=2))
+
+
+# =============================================================================
 # Device API (mTLS required - port 8443)
 # =============================================================================
 
@@ -192,6 +239,12 @@ async def dashboard():
     return FileResponse(STATIC_DIR / 'index.html')
 
 
+@app.get('/api/boards')
+async def api_boards():
+    """Return board registry {display_name: compatible}."""
+    return load_boards()
+
+
 @app.get('/api/manifest')
 async def api_manifest_dashboard():
     """Return manifest for dashboard."""
@@ -223,15 +276,18 @@ async def api_manifests():
 
 @app.get('/api/bundles')
 async def api_bundles():
-    """List all bundles."""
-    return [
-        {
+    """List all bundles with metadata."""
+    bundles = []
+    for b in BUNDLES_DIR.glob('*.raucb'):
+        meta = read_bundle_meta(b.name) or {}
+        bundles.append({
             'name': b.name,
             'size': b.stat().st_size,
             'mtime': datetime.fromtimestamp(b.stat().st_mtime).isoformat(),
-        }
-        for b in BUNDLES_DIR.glob('*.raucb')
-    ]
+            'compatible': meta.get('compatible'),
+            'board_name': meta.get('board_name'),
+        })
+    return bundles
 
 
 @app.post('/upload')
@@ -240,7 +296,8 @@ async def upload_bundle(
     activate: Optional[str] = Form(None),
     compatible: Optional[str] = Form(None),
 ):
-    """Upload a bundle."""
+    """Upload a bundle. compatible is resolved from board registry on the dashboard,
+    or passed directly by CI/CD pipelines."""
     if not bundle.filename:
         raise HTTPException(status_code=400, detail='No file selected')
     if not bundle.filename.endswith('.raucb'):
@@ -256,10 +313,15 @@ async def upload_bundle(
             f.write(chunk)
             sha256.update(chunk)
 
+    resolved_compatible = normalize_compatible(compatible) if compatible and compatible.strip() else None
+
+    # Always persist compatible metadata when provided so Activate needs no prompt.
+    if resolved_compatible:
+        save_bundle_meta(filename, resolved_compatible)
+
     if activate == 'true':
-        if not compatible or not compatible.strip():
+        if not resolved_compatible:
             raise HTTPException(status_code=400, detail='compatible is required when activating')
-        resolved_compatible = normalize_compatible(compatible)
         save_manifest(
             {
                 'bundle_url': manifest_bundle_url(filename),
@@ -276,11 +338,16 @@ async def upload_bundle(
 
 @app.post('/activate/{filename}')
 async def activate_bundle(filename: str, compatible: Optional[str] = None):
-    """Set bundle as active."""
+    """Set bundle as active. Resolves compatible from: explicit arg > metadata sidecar."""
     safe_filename = secure_filename(filename)
     filepath = BUNDLES_DIR / safe_filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail='Bundle not found')
+
+    # Prefer explicit compatible (CI/CD or URL path), fall back to stored metadata.
+    if not compatible:
+        meta = read_bundle_meta(safe_filename)
+        compatible = meta.get('compatible') if meta else None
 
     save_manifest(
         {
@@ -297,7 +364,7 @@ async def activate_bundle(filename: str, compatible: Optional[str] = None):
 
 @app.post('/activate/{compatible}/{filename}')
 async def activate_bundle_for_compatible(compatible: str, filename: str):
-    """Set bundle as active for specific compatible."""
+    """Set bundle as active for specific compatible (CI/CD / direct API use)."""
     return await activate_bundle(filename=filename, compatible=compatible)
 
 
@@ -326,9 +393,10 @@ async def delete_bundle(filename: str, compatible: Optional[str] = None):
         if parsed and parsed.get('filename') == safe_filename:
             manifest_file.unlink(missing_ok=True)
 
-    # Delete file only when no manifest still references it.
+    # Delete file and its metadata sidecar only when no manifest still references it.
     if filepath.exists() and not any_manifest_references(safe_filename):
         filepath.unlink()
+        bundle_meta_path(safe_filename).unlink(missing_ok=True)
 
     return RedirectResponse(url='/', status_code=303)
 

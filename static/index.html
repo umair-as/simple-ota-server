@@ -142,6 +142,12 @@
             <div class="p-4 border-b border-gray-200 dark:border-gray-800">
                 <h2 class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-3">Upload Bundle</h2>
                 <form id="upload-form" class="space-y-3">
+                    <div>
+                        <label for="board-select" class="text-xs font-medium text-gray-600 dark:text-gray-400 block mb-1">Target Board</label>
+                        <select id="board-select" class="field-input">
+                            <option value="">Select board…</option>
+                        </select>
+                    </div>
                     <div id="drop-zone" class="drop-zone border-2 border-dashed border-gray-300 dark:border-gray-700 rounded-lg p-4 text-center cursor-pointer hover:border-primary hover:bg-primary/5 transition">
                         <input type="file" name="bundle" id="bundle" accept=".raucb" required class="hidden">
                         <svg class="w-8 h-8 mx-auto mb-2 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -156,7 +162,7 @@
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
                         </svg>
-                        <span id="upload-btn-text">Select a file</span>
+                        <span id="upload-btn-text">Select a board &amp; file</span>
                     </button>
                     <p class="text-xs text-gray-500 dark:text-gray-400">Drop a <code>.raucb</code> bundle to store it on the server.</p>
                 </form>
@@ -208,6 +214,7 @@
 
         let allManifests = [];
         let allBundles = [];
+        let allBoards = {};
         let selectedFile = null;
         let toastTimer = null;
         $('footer-year').textContent = new Date().getFullYear();
@@ -233,6 +240,23 @@
         const dropText = $('drop-text');
         const uploadBtn = $('upload-btn');
         const uploadBtnText = $('upload-btn-text');
+        const boardSelect = $('board-select');
+
+        async function loadBoards() {
+            try {
+                allBoards = await fetch('/api/boards').then(r => r.json());
+                boardSelect.innerHTML = '<option value="">Select board…</option>';
+                for (const [name, compatible] of Object.entries(allBoards)) {
+                    const opt = document.createElement('option');
+                    opt.value = compatible;
+                    opt.textContent = name;
+                    boardSelect.appendChild(opt);
+                }
+            } catch (e) {
+                console.error('Failed to load boards:', e);
+            }
+        }
+        boardSelect.addEventListener('change', updateUploadButtonState);
 
         function openFilePicker() {
             if (window.innerWidth < 768) document.body.classList.add('sidebar-open');
@@ -240,8 +264,12 @@
         }
 
         function updateUploadButtonState() {
-            uploadBtn.disabled = !selectedFile;
-            uploadBtnText.textContent = selectedFile ? 'Upload Bundle' : 'Select a file';
+            const hasBoard = !!boardSelect.value;
+            const hasFile = !!selectedFile;
+            uploadBtn.disabled = !(hasBoard && hasFile);
+            uploadBtnText.textContent = !hasBoard ? 'Select a board &amp; file'
+                : !hasFile ? 'Select a file'
+                : 'Upload Bundle';
         }
 
         function updateFileSelection(file) {
@@ -310,14 +338,18 @@
                 const encodedName = encodeURIComponent(b.name);
                 const safeName = JSON.stringify(b.name);
                 const safeBundleUrl = JSON.stringify(bundleUrl(b.name));
-                const compatBadges = info ? info.compatibles.map(c =>
-                    `<span class="px-1.5 py-0.5 bg-primary/15 text-primary text-xs font-mono font-medium rounded" title="Active for board compatible: ${escHtml(c)}">${escHtml(c)}</span>`
-                ).join('') : '';
+                // Board badge: prefer bundle metadata, fall back to active manifest compatible
+                const boardLabel = b.board_name || b.compatible || (info?.compatibles?.[0] ?? '');
+                const boardCompatible = b.compatible || (info?.compatibles?.[0] ?? '');
+                const boardBadge = boardLabel
+                    ? `<span class="px-1.5 py-0.5 bg-primary/15 text-primary text-xs font-medium rounded" title="${escHtml(boardCompatible)}">${escHtml(boardLabel)}</span>`
+                    : '';
                 return `
                     <div class="flex flex-col sm:flex-row sm:items-start justify-between p-4 rounded-xl border ${isActive ? 'border-primary/40 bg-primary/5 dark:bg-primary/10' : 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800'} hover:shadow-md transition gap-3">
                         <div class="flex-1 min-w-0">
                             <div class="flex items-center gap-2 flex-wrap">
                                 ${isActive ? `<span class="px-1.5 py-0.5 bg-primary text-white text-xs font-bold rounded">ACTIVE</span>` : ''}
+                                ${boardBadge}
                                 <span class="font-mono text-sm text-gray-900 dark:text-white break-all">${escHtml(b.name)}</span>
                                 <button onclick='copyText(${safeName}, "Bundle name copied")' class="px-2 py-1 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 text-xs font-medium rounded-lg transition inline-flex items-center gap-1" title="Copy bundle filename">
                                     ${iconCopy} Name
@@ -330,7 +362,6 @@
                                 <span>${formatSize(b.size)}</span>
                                 <span>${formatDate(isActive ? info.released_at : b.mtime)}</span>
                                 ${info?.sha256 ? `<span class="font-mono" title="${escHtml(info.sha256)}">${info.sha256.slice(0,16)}&hellip;</span>` : ''}
-                                ${compatBadges}
                             </div>
                         </div>
                         <div class="flex items-center gap-2 flex-wrap flex-shrink-0">
@@ -413,9 +444,17 @@
             setTimeout(() => $('refresh-icon').classList.remove('animate-spin'), 500);
         }
 
-        // Activate: POST /activate/{filename} — server uses DEFAULT_COMPATIBLE
+        // Activate: POST /activate/{filename} — server resolves compatible from metadata sidecar.
+        // Falls back to prompt only for bundles uploaded before board registry was introduced.
         async function activateBundle(name) {
-            await fetch(`/activate/${encodeURIComponent(name)}`, { method: 'POST' });
+            const bundle = allBundles.find(b => b.name === name);
+            if (!bundle?.compatible) {
+                const entered = prompt('No board assigned to this bundle.\nEnter RAUC compatible string:');
+                if (!entered?.trim()) return;
+                await fetch(`/activate/${encodeURIComponent(entered.trim())}/${encodeURIComponent(name)}`, { method: 'POST' });
+            } else {
+                await fetch(`/activate/${encodeURIComponent(name)}`, { method: 'POST' });
+            }
             await refreshData();
             showToast('Bundle activated');
         }
@@ -449,21 +488,25 @@
             await refreshData();
         }
 
-        // Upload: store file only, no auto-activate
+        // Upload: store file and tag with board compatible
         $('upload-form').addEventListener('submit', async e => {
             e.preventDefault();
-            if (!selectedFile) return;
+            if (!selectedFile || !boardSelect.value) return;
             const data = new FormData();
             data.append('bundle', selectedFile);
+            data.append('compatible', boardSelect.value);
             uploadBtn.disabled = true;
             uploadBtnText.textContent = 'Uploading…';
             await fetch('/upload', { method: 'POST', body: data });
             resetFileSelection();
+            boardSelect.value = '';
+            updateUploadButtonState();
             await refreshData();
             showToast('Bundle uploaded');
             if (window.innerWidth < 768) document.body.classList.remove('sidebar-open');
         });
 
+        loadBoards();
         fetchData();
     </script>
 </body>
