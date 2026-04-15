@@ -1,8 +1,14 @@
 #!/bin/bash
 set -e
 
-# Get the primary LAN IP (the one used for default route)
-IP=$(ip -4 route get 1.1.1.1 | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+# Allow explicit override via environment variable (recommended when host
+# has multiple interfaces on the same subnet, e.g. WiFi + ethernet).
+if [ -n "$MDNS_IP" ]; then
+    IP="$MDNS_IP"
+else
+    # Fall back to the IP used for the default route.
+    IP=$(ip -4 route get 1.1.1.1 | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+fi
 
 if [ -z "$IP" ]; then
     echo "ERROR: Could not determine LAN IP"

@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
+    environment:
+      - MDNS_IP=${MDNS_IP:-}
     volumes:
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
 
@@ -34,4 +36,5 @@ services:
       - ./data:/data
       - ./certs:/certs:ro
       - ./static:/app/static:ro
+      - ./boards.json:/app/boards.json:ro
     restart: unless-stopped

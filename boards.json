@@ -1,0 +1,5 @@
+{
+  "Raspberry Pi 5 (iot-gw)": "iot-gateway-raspberrypi5",
+  "RZ/V2L SMARC": "rzv2l-smarc-rzv2l",
+  "VisionFive2": "visionfive2-image-dev"
+}
