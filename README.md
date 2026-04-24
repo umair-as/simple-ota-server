@@ -138,14 +138,14 @@ For testing OTA from real devices over the internet, deploy to a VPS using the d
 ### Prerequisites
 
 - VPS with Docker + Compose installed
-- SSH access configured (e.g. `ssh hetz-vps`)
+- SSH access to the VPS
 - Your CA at hand for generating server certs
 
 ### Generate server certificate for VPS
 
 ```bash
-# From your local machine, using the same CA
-cd ~/rauc-keys/ota-dev-ca/
+# From your local machine, cd into your CA directory
+cd /path/to/your/ca/
 
 openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -keyout vps-server.key -out vps-server.csr \
@@ -164,9 +164,9 @@ rsync -avz --exclude='certs/' --exclude='data/' --exclude='.git/' \
   ./ vps:~/ota-server/
 
 # Copy VPS-specific certs
-scp ~/rauc-keys/ota-dev-ca/vps-server.crt vps:~/ota-server/certs/server.crt
-scp ~/rauc-keys/ota-dev-ca/vps-server.key vps:~/ota-server/certs/server.key
-scp ~/rauc-keys/ota-dev-ca/ca.crt         vps:~/ota-server/certs/ca.crt
+scp /path/to/your/ca/vps-server.crt vps:~/ota-server/certs/server.crt
+scp /path/to/your/ca/vps-server.key vps:~/ota-server/certs/server.key
+scp /path/to/your/ca/ca.crt         vps:~/ota-server/certs/ca.crt
 
 # Create data dirs and start
 ssh vps "cd ~/ota-server && mkdir -p data/bundles data/devices && \
