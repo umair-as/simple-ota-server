@@ -131,6 +131,71 @@ Fallback options if mDNS isn't available on your network:
 - **Direct IP URL** — Set `SERVER_URL=https://<ip>:8443` in `.env` and include the IP in the cert SAN (the default scripts already do this)
 - **Router DNS** — Add a local DNS entry on your router pointing `ota-gw.local` to the server IP
 
+## VPS / Remote Deployment
+
+For testing OTA from real devices over the internet, deploy to a VPS using the dedicated compose file (no mDNS sidecar, hardcoded public IP).
+
+### Prerequisites
+
+- VPS with Docker + Compose installed
+- SSH access to the VPS
+- Your CA at hand for generating server certs
+
+### Generate server certificate for VPS
+
+```bash
+# From your local machine, cd into your CA directory
+cd /path/to/your/ca/
+
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout vps-server.key -out vps-server.csr \
+  -subj "/CN=ota-vps/O=IoT Gateway/OU=OTA"
+
+openssl x509 -req -in vps-server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out vps-server.crt -days 825 -sha256 \
+  -extfile <(printf "subjectAltName=IP:<VPS_IP>\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth")
+```
+
+### Deploy
+
+```bash
+# Copy project to VPS (certs/ and data/ are excluded, deployed separately)
+rsync -avz --exclude='certs/' --exclude='data/' --exclude='.git/' \
+  ./ vps:~/ota-server/
+
+# Copy VPS-specific certs
+scp /path/to/your/ca/vps-server.crt vps:~/ota-server/certs/server.crt
+scp /path/to/your/ca/vps-server.key vps:~/ota-server/certs/server.key
+scp /path/to/your/ca/ca.crt         vps:~/ota-server/certs/ca.crt
+
+# Create data dirs and start
+ssh vps "cd ~/ota-server && mkdir -p data/bundles data/devices && \
+  docker compose -f docker-compose.vps.yml up -d --build"
+```
+
+### Firewall
+
+Open only the mTLS port — the dashboard stays localhost-only:
+
+```bash
+sudo firewall-cmd --add-port=8443/tcp --permanent
+sudo firewall-cmd --reload
+```
+
+### Access the dashboard
+
+```bash
+ssh -L 8080:localhost:8080 vps
+# Then open http://localhost:8080
+```
+
+### Test mTLS from a device or local machine
+
+```bash
+curl --cacert ca.crt --cert device.crt --key device.key \
+  https://<VPS_IP>:8443/health
+```
+
 ## Device Integration
 
 ### RAUC system.conf (streaming with mTLS)

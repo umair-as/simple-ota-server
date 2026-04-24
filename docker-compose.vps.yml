@@ -1,0 +1,29 @@
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8443:8443"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/certs:ro
+      - ./data:/data:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  app:
+    build: .
+    expose:
+      - "8081"
+    environment:
+      - DATA_DIR=/data
+      - SERVER_URL=https://204.168.255.56:8443
+      - DEFAULT_COMPATIBLE=${DEFAULT_COMPATIBLE:-default}
+      - COMPATIBLE=${COMPATIBLE:-default}
+    volumes:
+      - ./data:/data
+      - ./certs:/certs:ro
+      - ./static:/app/static:ro
+      - ./boards.json:/app/boards.json:ro
+    restart: unless-stopped
