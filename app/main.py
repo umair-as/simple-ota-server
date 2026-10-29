@@ -5,13 +5,14 @@ RAUC Simple Server - OTA update server with mTLS and web dashboard.
 import os
 import json
 import hashlib
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="RAUC Simple Server", version="1.0.0")
@@ -35,6 +36,21 @@ MANIFESTS_DIR.mkdir(parents=True, exist_ok=True)
 # Static files
 STATIC_DIR = Path('/app/static')
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
+
+
+@app.middleware('http')
+async def reject_cross_origin_writes(request: Request, call_next):
+    """CSRF guard: the dashboard has no auth, so refuse state-changing requests
+    whose Origin does not match the Host. Requests without Origin (curl, CI/CD)
+    are unaffected."""
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        origin = request.headers.get('origin')
+        if origin is not None:
+            origin_host = urlsplit(origin).hostname
+            request_host = urlsplit('//' + request.headers.get('host', '')).hostname
+            if not origin_host or origin_host != request_host:
+                return JSONResponse({'detail': 'Cross-origin request rejected'}, status_code=403)
+    return await call_next(request)
 
 
 # =============================================================================
@@ -119,6 +135,15 @@ def secure_filename(filename: str) -> str:
     """Sanitize filename for safe filesystem storage."""
     filename = filename.replace('/', '').replace('\\', '').replace('\x00', '')
     return ''.join(c for c in filename if c.isalnum() or c in '._-')
+
+
+def bundle_path(filename: str) -> Path:
+    """Resolve a user-supplied name to an existing bundle file, or raise 404."""
+    safe = secure_filename(filename)
+    path = BUNDLES_DIR / safe
+    if not safe.endswith('.raucb') or not path.is_file():
+        raise HTTPException(status_code=404, detail='Bundle not found')
+    return path
 
 
 def hash_file(filepath: Path, chunk_size: int = 8192) -> str:
@@ -223,9 +248,7 @@ async def api_manifest_by_compatible(compatible: str, request: Request):
 async def serve_bundle(filename: str, request: Request):
     """Serve bundle file (mTLS required)."""
     require_mtls(request)
-    filepath = BUNDLES_DIR / secure_filename(filename)
-    if not filepath.exists():
-        raise HTTPException(status_code=404, detail='Bundle not found')
+    filepath = bundle_path(filename)
     return FileResponse(filepath, filename=filename, media_type='application/octet-stream')
 
 
@@ -306,12 +329,21 @@ async def upload_bundle(
     filename = secure_filename(bundle.filename)
     filepath = BUNDLES_DIR / filename
 
-    # Stream to disk
+    # Stream to a temp file, then atomically replace so a failed or partial
+    # upload never clobbers a bundle that is being served.
     sha256 = hashlib.sha256()
-    with open(filepath, 'wb') as f:
-        while chunk := await bundle.read(8192):
-            f.write(chunk)
-            sha256.update(chunk)
+    with tempfile.NamedTemporaryFile(dir=BUNDLES_DIR, prefix='.upload-', suffix='.part', delete=False) as f:
+        tmp_path = Path(f.name)
+        try:
+            while chunk := await bundle.read(8192):
+                f.write(chunk)
+                sha256.update(chunk)
+            f.flush()
+            os.fchmod(f.fileno(), 0o644)  # nginx serves bundles as a different user
+            os.replace(tmp_path, filepath)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     resolved_compatible = normalize_compatible(compatible) if compatible and compatible.strip() else None
 
@@ -339,10 +371,8 @@ async def upload_bundle(
 @app.post('/activate/{filename}')
 async def activate_bundle(filename: str, compatible: Optional[str] = None):
     """Set bundle as active. Resolves compatible from: explicit arg > metadata sidecar."""
-    safe_filename = secure_filename(filename)
-    filepath = BUNDLES_DIR / safe_filename
-    if not filepath.exists():
-        raise HTTPException(status_code=404, detail='Bundle not found')
+    filepath = bundle_path(filename)
+    safe_filename = filepath.name
 
     # Prefer explicit compatible (CI/CD or URL path), fall back to stored metadata.
     if not compatible:
@@ -380,6 +410,8 @@ async def deactivate_compatible(compatible: str):
 async def delete_bundle(filename: str, compatible: Optional[str] = None):
     """Delete a bundle."""
     safe_filename = secure_filename(filename)
+    if not safe_filename.endswith('.raucb'):
+        raise HTTPException(status_code=404, detail='Bundle not found')
     filepath = BUNDLES_DIR / safe_filename
 
     resolved_compatible = normalize_compatible(compatible or DEFAULT_COMPATIBLE)
