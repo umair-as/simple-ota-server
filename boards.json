@@ -1,5 +1,7 @@
 {
   "Raspberry Pi 5 (iot-gw)": "iot-gateway-raspberrypi5",
   "RZ/V2L SMARC": "rzv2l-smarc-rzv2l",
-  "VisionFive2": "visionfive2-image-dev"
+  "VisionFive2": "visionfive2-image-dev",
+  "Raspberry Pi 5 (edge-ai)": "edge-ai-raspberrypi5",
+  "RZ/V2L SMARC (edge-ai)": "edge-ai-smarc-rzv2l"
 }

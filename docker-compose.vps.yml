@@ -21,7 +21,7 @@ services:
       - "8081"
     environment:
       - DATA_DIR=/data
-      - SERVER_URL=https://204.168.255.56:8443
+      - SERVER_URL=${SERVER_URL:?set SERVER_URL in .env, e.g. https://<vps-ip>:8443}
       - DEFAULT_COMPATIBLE=${DEFAULT_COMPATIBLE:-default}
       - COMPATIBLE=${COMPATIBLE:-default}
     volumes:

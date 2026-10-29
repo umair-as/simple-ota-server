@@ -23,7 +23,7 @@ cp .env.example .env
 vim .env  # Set SERVER_URL and DEFAULT_COMPATIBLE
 
 # Generate certificates (DNS name + optional IP)
-./scripts/generate-certs.sh certs ota-gw.local 192.168.0.193
+./scripts/generate-certs.sh certs ota-gw.local 192.168.1.10
 
 # Start
 docker compose up -d
@@ -86,7 +86,7 @@ The CA is generated once and reused for all server and device certificates. Rege
 
 ```bash
 # Creates CA (if missing) + server cert in one command
-./scripts/generate-certs.sh certs ota-gw.local 192.168.0.193
+./scripts/generate-certs.sh certs ota-gw.local 192.168.1.10
 ```
 
 ### Individual scripts
@@ -102,7 +102,7 @@ The CA is generated once and reused for all server and device certificates. Rege
 **Generate server certificate** — requires an existing CA:
 
 ```bash
-./scripts/generate-server-cert.sh certs ota-gw.local 192.168.0.193
+./scripts/generate-server-cert.sh certs ota-gw.local 192.168.1.10
 # IP is auto-detected if omitted
 ```
 
@@ -129,11 +129,12 @@ The `mdns` sidecar container advertises `ota-gw.local` via Avahi/mDNS. This is b
 Fallback options if mDNS isn't available on your network:
 
 - **Direct IP URL** — Set `SERVER_URL=https://<ip>:8443` in `.env` and include the IP in the cert SAN (the default scripts already do this)
+- **`/etc/hosts`** — Add `<server-ip> ota-gw.local` on each device (most reliable when the router blocks multicast)
 - **Router DNS** — Add a local DNS entry on your router pointing `ota-gw.local` to the server IP
 
 ## VPS / Remote Deployment
 
-For testing OTA from real devices over the internet, deploy to a VPS using the dedicated compose file (no mDNS sidecar, hardcoded public IP).
+For testing OTA from real devices over the internet, deploy to a VPS using the dedicated compose file (no mDNS sidecar; set `SERVER_URL` in `.env` to `https://<VPS_IP>:8443`).
 
 ### Prerequisites
 
@@ -195,6 +196,13 @@ ssh -L 8080:localhost:8080 vps
 curl --cacert ca.crt --cert device.crt --key device.key \
   https://<VPS_IP>:8443/health
 ```
+
+## Used with
+
+This server hosts the RAUC bundles built by these Yocto projects. Each project's `RAUC_BUNDLE_COMPATIBLE` is registered in `boards.json`:
+
+- [rpi5-iot-gateway](https://github.com/umair-as/rpi5-iot-gateway) – `iot-gateway-<machine>`
+- [edge-ai-yocto](https://github.com/umair-as/edge-ai-yocto) – `edge-ai-<machine>`
 
 ## Device Integration
 
