@@ -3,8 +3,15 @@ services:
     build: ./mdns
     network_mode: host
     restart: unless-stopped
+    # Root on the system D-Bus is effectively host root, so run unprivileged;
+    # avahi's D-Bus policy lets any user publish records.
+    user: "65534:65534"
+    cap_drop:
+      - ALL
+    read_only: true
     security_opt:
       - apparmor:unconfined
+      - no-new-privileges:true
     environment:
       - MDNS_IP=${MDNS_IP:-}
     volumes:
@@ -17,7 +24,10 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./certs:/certs:ro
+      # Only what nginx needs - never expose ca.key or device keys to a network-facing container
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - ./certs/server.crt:/certs/server.crt:ro
+      - ./certs/server.key:/certs/server.key:ro
       - ./data:/data:ro
     depends_on:
       - app
@@ -34,7 +44,6 @@ services:
       - COMPATIBLE=${COMPATIBLE:-default}
     volumes:
       - ./data:/data
-      - ./certs:/certs:ro
       - ./static:/app/static:ro
       - ./boards.json:/app/boards.json:ro
     restart: unless-stopped
