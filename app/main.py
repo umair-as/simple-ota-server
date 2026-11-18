@@ -6,6 +6,7 @@ import os
 import json
 import hashlib
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -14,6 +15,7 @@ from urllib.parse import quote, urlsplit
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 app = FastAPI(title="RAUC Simple Server", version="1.0.0")
 
@@ -28,9 +30,26 @@ DEFAULT_COMPATIBLE = os.environ.get(
 MANIFESTS_DIR = DATA_DIR / 'manifests'
 LEGACY_MANIFEST_FILE = DATA_DIR / 'manifest.json'
 BOARDS_FILE = Path('/app/boards.json')
+UPLOAD_TMP_DIR = DATA_DIR / '.tmp'
 
 # Ensure directories exist
 BUNDLES_DIR.mkdir(parents=True, exist_ok=True)
+# In-flight uploads live outside bundles/ (which nginx serves to devices) but on
+# the same filesystem, so the final os.replace() into bundles/ stays atomic.
+# Also used as the multipart spool dir, keeping multi-GB uploads off the
+# container's overlay /tmp.
+UPLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
+tempfile.tempdir = str(UPLOAD_TMP_DIR)
+# Sweep temp files left by interrupted uploads, including the .upload-*.part
+# files that older versions staged inside bundles/. Only files older than a day,
+# so a second process can never pull an in-flight upload out from under another.
+STALE_UPLOAD_AGE = 24 * 3600
+for stale in [*UPLOAD_TMP_DIR.glob('upload-*.part'), *BUNDLES_DIR.glob('.upload-*.part')]:
+    try:
+        if time.time() - stale.stat().st_mtime > STALE_UPLOAD_AGE:
+            stale.unlink()
+    except FileNotFoundError:
+        pass
 MANIFESTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Static files
@@ -146,7 +165,7 @@ def bundle_path(filename: str) -> Path:
     return path
 
 
-def hash_file(filepath: Path, chunk_size: int = 8192) -> str:
+def hash_file(filepath: Path, chunk_size: int = 1024 * 1024) -> str:
     """Calculate SHA256 hash using streaming."""
     sha256 = hashlib.sha256()
     with open(filepath, 'rb') as f:
@@ -163,6 +182,17 @@ def read_manifest_file(path: Path) -> Optional[dict]:
         return json.loads(path.read_text())
     except Exception:
         return None
+
+
+def refresh_manifests_for(filename: str, size: int, sha256: str) -> None:
+    """A re-upload replaced the bytes behind filename; keep every manifest that
+    points at it in step, or devices would verify against the old sha256/size."""
+    for mf in MANIFESTS_DIR.glob('*.json'):
+        parsed = read_manifest_file(mf)
+        if parsed and parsed.get('filename') == filename:
+            parsed['size'] = size
+            parsed['sha256'] = sha256
+            save_manifest(parsed, compatible=parsed.get('compatible') or mf.stem)
 
 
 def any_manifest_references(filename: str) -> bool:
@@ -313,6 +343,27 @@ async def api_bundles():
     return bundles
 
 
+def stage_upload(src, dest: Path) -> str:
+    """Copy an uploaded file into place and return its sha256. Writes to a temp
+    file outside bundles/ first, then atomically replaces dest, so a failed or
+    partial upload is never visible to devices and never clobbers a live bundle."""
+    src.seek(0)
+    sha256 = hashlib.sha256()
+    with tempfile.NamedTemporaryFile(dir=UPLOAD_TMP_DIR, prefix='upload-', suffix='.part', delete=False) as f:
+        tmp_path = Path(f.name)
+        try:
+            while chunk := src.read(1024 * 1024):
+                f.write(chunk)
+                sha256.update(chunk)
+            f.flush()
+            os.fchmod(f.fileno(), 0o644)  # nginx serves bundles as a different user
+            os.replace(tmp_path, dest)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    return sha256.hexdigest()
+
+
 @app.post('/upload')
 async def upload_bundle(
     bundle: UploadFile = File(...),
@@ -326,40 +377,30 @@ async def upload_bundle(
     if not bundle.filename.endswith('.raucb'):
         raise HTTPException(status_code=400, detail='File must be a .raucb bundle')
 
+    resolved_compatible = normalize_compatible(compatible) if compatible and compatible.strip() else None
+    # Validate before touching bundles/, so a rejected request changes nothing.
+    if activate == 'true' and not resolved_compatible:
+        raise HTTPException(status_code=400, detail='compatible is required when activating')
+
     filename = secure_filename(bundle.filename)
     filepath = BUNDLES_DIR / filename
 
-    # Stream to a temp file, then atomically replace so a failed or partial
-    # upload never clobbers a bundle that is being served.
-    sha256 = hashlib.sha256()
-    with tempfile.NamedTemporaryFile(dir=BUNDLES_DIR, prefix='.upload-', suffix='.part', delete=False) as f:
-        tmp_path = Path(f.name)
-        try:
-            while chunk := await bundle.read(8192):
-                f.write(chunk)
-                sha256.update(chunk)
-            f.flush()
-            os.fchmod(f.fileno(), 0o644)  # nginx serves bundles as a different user
-            os.replace(tmp_path, filepath)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
-
-    resolved_compatible = normalize_compatible(compatible) if compatible and compatible.strip() else None
+    # Copy + hash in a thread: for multi-GB bundles this takes seconds and would
+    # otherwise stall the single worker (and with it the device API).
+    digest = await run_in_threadpool(stage_upload, bundle.file, filepath)
+    refresh_manifests_for(filename, filepath.stat().st_size, digest)
 
     # Always persist compatible metadata when provided so Activate needs no prompt.
     if resolved_compatible:
         save_bundle_meta(filename, resolved_compatible)
 
     if activate == 'true':
-        if not resolved_compatible:
-            raise HTTPException(status_code=400, detail='compatible is required when activating')
         save_manifest(
             {
                 'bundle_url': manifest_bundle_url(filename),
                 'filename': filename,
                 'size': filepath.stat().st_size,
-                'sha256': sha256.hexdigest(),
+                'sha256': digest,
                 'released_at': datetime.now().isoformat(),
             },
             compatible=resolved_compatible,
@@ -384,7 +425,7 @@ async def activate_bundle(filename: str, compatible: Optional[str] = None):
             'bundle_url': manifest_bundle_url(safe_filename),
             'filename': safe_filename,
             'size': filepath.stat().st_size,
-            'sha256': hash_file(filepath),
+            'sha256': await run_in_threadpool(hash_file, filepath),
             'released_at': datetime.now().isoformat(),
         },
         compatible=compatible or DEFAULT_COMPATIBLE,
