@@ -1,0 +1,14 @@
+# Rootless podman on an SELinux host (Fedora/RHEL):
+#   podman-compose -f docker-compose.yml -f docker-compose.podman.yml up -d
+#
+# The mdns sidecar talks to the host's avahi over the system D-Bus. D-Bus EXTERNAL
+# auth requires the uid inside the container to equal the socket peer's host uid,
+# which rootless podman only gives with keep-id (and no explicit `user:`), and the
+# SELinux container policy blocks the socket unless the sidecar is unlabelled.
+# nginx and app are unaffected and stay confined.
+services:
+  mdns:
+    userns_mode: keep-id
+    user: !reset null
+    security_opt:
+      - label=disable

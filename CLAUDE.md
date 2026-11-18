@@ -11,6 +11,7 @@ A small OTA server for RAUC bundles: a FastAPI app (`app/main.py`, single file) 
 ```bash
 docker compose up -d --build        # start / rebuild (app image bakes in app/main.py)
 docker compose -f docker-compose.vps.yml up -d --build   # VPS variant (needs SERVER_URL in .env, no mdns sidecar)
+podman-compose -f docker-compose.yml -f docker-compose.podman.yml up -d --build   # rootless podman + SELinux (Fedora): mdns needs keep-id + label=disable
 docker compose exec nginx nginx -t && docker compose exec nginx nginx -s reload   # config/nginx.conf is bind-mounted; reload applies it without a restart
 curl http://127.0.0.1:8080/health   # dashboard port; device port is :8443 (mTLS)
 
@@ -43,7 +44,7 @@ State is plain files under `DATA_DIR` (`/data`), no database:
 - User-supplied filenames go through `secure_filename()`/`bundle_path()` (only `*.raucb` files that exist); keep new file routes behind them.
 - State-changing routes are protected only by the Origin-vs-Host middleware, since the dashboard has no auth. Don't expose `:8080` beyond localhost.
 - nginx is pinned by tag + digest in both compose files; bump both together (stable branch, digest from `skopeo inspect`), never back to a floating tag.
-- Bind mounts carry `z` so they work under SELinux (Fedora/podman); keep it on new mounts. In-flight uploads live in `/data/.tmp` (never under `bundles/`, which devices can fetch), and the dashboard accepts up to 2G (`client_max_body_size`).
+- Bind mounts carry `z` so they work under SELinux (Fedora/podman); keep it on new mounts. In-flight uploads live in `/data/.tmp` (never under `bundles/`, which devices can fetch); `/upload` parses multipart itself (`BundleUploadSink`) so a bundle is written to disk once, so don't switch it back to `UploadFile`, and the dashboard accepts up to 2G (`client_max_body_size`).
 - Never mount `certs/` wholesale into containers; `ca.key` and device keys live there. nginx gets only `ca.crt`, `server.crt`, `server.key`.
 - `certs/`, `data/`, `.env` are gitignored. Keep LAN/VPS IPs and local paths out of committed files, and don't reference unreleased boards or projects; this repo is public.
 - Git: never commit to `main`; use `feat/…` or `fix/…` branches and PRs, squash-merged.
