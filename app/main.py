@@ -12,10 +12,13 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
+from python_multipart.exceptions import MultipartParseError
+from python_multipart.multipart import MultipartParser, parse_options_header
 
 app = FastAPI(title="RAUC Simple Server", version="1.0.0")
 
@@ -36,10 +39,7 @@ UPLOAD_TMP_DIR = DATA_DIR / '.tmp'
 BUNDLES_DIR.mkdir(parents=True, exist_ok=True)
 # In-flight uploads live outside bundles/ (which nginx serves to devices) but on
 # the same filesystem, so the final os.replace() into bundles/ stays atomic.
-# Also used as the multipart spool dir, keeping multi-GB uploads off the
-# container's overlay /tmp.
 UPLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
-tempfile.tempdir = str(UPLOAD_TMP_DIR)
 # Sweep temp files left by interrupted uploads, including the .upload-*.part
 # files that older versions staged inside bundles/. Only files older than a day,
 # so a second process can never pull an in-flight upload out from under another.
@@ -343,51 +343,154 @@ async def api_bundles():
     return bundles
 
 
-def stage_upload(src, dest: Path) -> str:
-    """Copy an uploaded file into place and return its sha256. Writes to a temp
-    file outside bundles/ first, then atomically replaces dest, so a failed or
-    partial upload is never visible to devices and never clobbers a live bundle."""
-    src.seek(0)
-    sha256 = hashlib.sha256()
-    with tempfile.NamedTemporaryFile(dir=UPLOAD_TMP_DIR, prefix='upload-', suffix='.part', delete=False) as f:
-        tmp_path = Path(f.name)
-        try:
-            while chunk := src.read(1024 * 1024):
-                f.write(chunk)
-                sha256.update(chunk)
-            f.flush()
-            os.fchmod(f.fileno(), 0o644)  # nginx serves bundles as a different user
-            os.replace(tmp_path, dest)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
-    return sha256.hexdigest()
+UPLOAD_FIELD_LIMIT = 4096        # bytes, for the small text fields
+UPLOAD_BATCH = 1024 * 1024       # hand the parser ~1 MiB per threadpool hop
+
+
+class BundleUploadSink:
+    """python-multipart callbacks: stream the `bundle` file part straight into a
+    staging file in UPLOAD_TMP_DIR (hashing as it goes) and collect the small
+    text fields. One disk write per byte, no spool, nothing in bundles/ yet."""
+
+    def __init__(self):
+        self.fields: dict[str, str] = {}
+        self.filename: Optional[str] = None
+        self.tmp_path: Optional[Path] = None
+        self.size = 0
+        self._sha256 = hashlib.sha256()
+        self._file = None
+        self._reset_part()
+
+    def _reset_part(self):
+        self._headers: dict[bytes, bytes] = {}
+        self._hfield = b''
+        self._hvalue = b''
+        self._name: Optional[str] = None
+        self._buf: Optional[bytearray] = None
+        self._is_file = False
+
+    # header parsing
+    def on_part_begin(self):
+        self._reset_part()
+
+    def on_header_field(self, data, start, end):
+        self._hfield += data[start:end]
+
+    def on_header_value(self, data, start, end):
+        self._hvalue += data[start:end]
+
+    def on_header_end(self):
+        self._headers[self._hfield.strip().lower()] = self._hvalue.strip()
+        self._hfield = self._hvalue = b''
+
+    def on_headers_finished(self):
+        _, params = parse_options_header(self._headers.get(b'content-disposition', b''))
+        self._name = params.get(b'name', b'').decode('utf-8', 'replace')
+        raw_filename = params.get(b'filename')
+        if self._name == 'bundle' and raw_filename is not None:
+            if self._file is not None:
+                raise HTTPException(status_code=400, detail='Only one bundle per upload')
+            name = raw_filename.decode('utf-8', 'replace')
+            if not name:
+                raise HTTPException(status_code=400, detail='No file selected')
+            if not name.endswith('.raucb'):
+                raise HTTPException(status_code=400, detail='File must be a .raucb bundle')
+            self.filename = secure_filename(name)
+            self._file = tempfile.NamedTemporaryFile(
+                dir=UPLOAD_TMP_DIR, prefix='upload-', suffix='.part', delete=False)
+            self.tmp_path = Path(self._file.name)
+            self._is_file = True
+        else:
+            self._buf = bytearray()
+
+    # body
+    def on_part_data(self, data, start, end):
+        chunk = data[start:end]
+        if self._is_file:
+            self._file.write(chunk)
+            self._sha256.update(chunk)
+            self.size += len(chunk)
+        elif self._buf is not None:
+            if len(self._buf) + len(chunk) > UPLOAD_FIELD_LIMIT:
+                raise HTTPException(status_code=400, detail=f'Field {self._name!r} too large')
+            self._buf += chunk
+
+    def on_part_end(self):
+        if self._is_file:
+            self._file.flush()
+            os.fchmod(self._file.fileno(), 0o644)  # nginx serves bundles as a different user
+            self._file.close()
+        elif self._name:
+            self.fields[self._name] = self._buf.decode('utf-8', 'replace')
+
+    def callbacks(self) -> dict:
+        return {name: getattr(self, name) for name in (
+            'on_part_begin', 'on_header_field', 'on_header_value', 'on_header_end',
+            'on_headers_finished', 'on_part_data', 'on_part_end')}
+
+    @property
+    def sha256(self) -> str:
+        return self._sha256.hexdigest()
+
+    def discard(self):
+        if self._file is not None and not self._file.closed:
+            self._file.close()
+        if self.tmp_path is not None:
+            self.tmp_path.unlink(missing_ok=True)
 
 
 @app.post('/upload')
-async def upload_bundle(
-    bundle: UploadFile = File(...),
-    activate: Optional[str] = Form(None),
-    compatible: Optional[str] = Form(None),
-):
-    """Upload a bundle. compatible is resolved from board registry on the dashboard,
-    or passed directly by CI/CD pipelines."""
-    if not bundle.filename:
-        raise HTTPException(status_code=400, detail='No file selected')
-    if not bundle.filename.endswith('.raucb'):
-        raise HTTPException(status_code=400, detail='File must be a .raucb bundle')
+async def upload_bundle(request: Request):
+    """Upload a bundle (multipart: bundle file, optional compatible, activate=true).
+    compatible is resolved from board registry on the dashboard, or passed
+    directly by CI/CD pipelines.
 
-    resolved_compatible = normalize_compatible(compatible) if compatible and compatible.strip() else None
-    # Validate before touching bundles/, so a rejected request changes nothing.
-    if activate == 'true' and not resolved_compatible:
-        raise HTTPException(status_code=400, detail='compatible is required when activating')
+    The body is parsed as it streams in rather than through UploadFile, which
+    would spool the whole bundle to disk first and then need a second copy."""
+    ctype, params = parse_options_header(request.headers.get('content-type', ''))
+    boundary = params.get(b'boundary')
+    if ctype != b'multipart/form-data' or not boundary:
+        raise HTTPException(status_code=400, detail='Expected multipart/form-data')
 
-    filename = secure_filename(bundle.filename)
-    filepath = BUNDLES_DIR / filename
+    sink = BundleUploadSink()
+    parser = MultipartParser(boundary, sink.callbacks())
+    try:
+        # Parsing writes to disk, so batch chunks and run the parser off the event loop.
+        batch = bytearray()
+        async for chunk in request.stream():
+            batch += chunk
+            if len(batch) >= UPLOAD_BATCH:
+                await run_in_threadpool(parser.write, bytes(batch))
+                batch.clear()
+        if batch:
+            await run_in_threadpool(parser.write, bytes(batch))
+        parser.finalize()
 
-    # Copy + hash in a thread: for multi-GB bundles this takes seconds and would
-    # otherwise stall the single worker (and with it the device API).
-    digest = await run_in_threadpool(stage_upload, bundle.file, filepath)
+        if sink.tmp_path is None or not sink._file.closed:
+            raise HTTPException(status_code=400, detail='No file selected')
+
+        compatible = sink.fields.get('compatible')
+        activate = sink.fields.get('activate')
+        resolved_compatible = normalize_compatible(compatible) if compatible and compatible.strip() else None
+        # Validate before touching bundles/, so a rejected request changes nothing.
+        if activate == 'true' and not resolved_compatible:
+            raise HTTPException(status_code=400, detail='compatible is required when activating')
+
+        filename = sink.filename
+        filepath = BUNDLES_DIR / filename
+        # Atomic: a failed or partial upload never clobbers a bundle being served.
+        os.replace(sink.tmp_path, filepath)
+    except ClientDisconnect:
+        sink.discard()
+        return Response(status_code=400)  # client is gone; nothing to report
+    except MultipartParseError as e:
+        sink.discard()
+        raise HTTPException(status_code=400, detail=f'Malformed multipart body: {e}')
+    except BaseException:
+        sink.discard()
+        raise
+
+    digest = sink.sha256
     refresh_manifests_for(filename, filepath.stat().st_size, digest)
 
     # Always persist compatible metadata when provided so Activate needs no prompt.

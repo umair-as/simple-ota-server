@@ -27,6 +27,10 @@ vim .env  # Set SERVER_URL and DEFAULT_COMPATIBLE
 
 # Start
 docker compose up -d
+
+# Rootless podman on an SELinux host (Fedora/RHEL): add the podman override so the
+# mdns sidecar can reach the host's avahi over D-Bus
+podman-compose -f docker-compose.yml -f docker-compose.podman.yml up -d
 ```
 
 **Dashboard** (localhost only — use SSH tunnel for remote access):
