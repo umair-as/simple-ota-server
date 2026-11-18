@@ -345,6 +345,7 @@ async def api_bundles():
 
 UPLOAD_FIELD_LIMIT = 4096        # bytes, for the small text fields
 UPLOAD_BATCH = 1024 * 1024       # hand the parser ~1 MiB per threadpool hop
+UPLOAD_MAX_FIELDS = 16           # the form has 3; Starlette capped this too
 
 
 class BundleUploadSink:
@@ -359,6 +360,7 @@ class BundleUploadSink:
         self.size = 0
         self._sha256 = hashlib.sha256()
         self._file = None
+        self.complete = False
         self._reset_part()
 
     def _reset_part(self):
@@ -421,12 +423,17 @@ class BundleUploadSink:
             os.fchmod(self._file.fileno(), 0o644)  # nginx serves bundles as a different user
             self._file.close()
         elif self._name:
+            if len(self.fields) >= UPLOAD_MAX_FIELDS:
+                raise HTTPException(status_code=400, detail='Too many form fields')
             self.fields[self._name] = self._buf.decode('utf-8', 'replace')
+
+    def on_end(self):
+        self.complete = True  # closing boundary seen; finalize() alone doesn't check
 
     def callbacks(self) -> dict:
         return {name: getattr(self, name) for name in (
             'on_part_begin', 'on_header_field', 'on_header_value', 'on_header_end',
-            'on_headers_finished', 'on_part_data', 'on_part_end')}
+            'on_headers_finished', 'on_part_data', 'on_part_end', 'on_end')}
 
     @property
     def sha256(self) -> str:
@@ -453,7 +460,10 @@ async def upload_bundle(request: Request):
         raise HTTPException(status_code=400, detail='Expected multipart/form-data')
 
     sink = BundleUploadSink()
-    parser = MultipartParser(boundary, sink.callbacks())
+    try:
+        parser = MultipartParser(boundary, sink.callbacks())
+    except ValueError:
+        raise HTTPException(status_code=400, detail='Invalid multipart boundary')
     try:
         # Parsing writes to disk, so batch chunks and run the parser off the event loop.
         batch = bytearray()
@@ -466,8 +476,10 @@ async def upload_bundle(request: Request):
             await run_in_threadpool(parser.write, bytes(batch))
         parser.finalize()
 
-        if sink.tmp_path is None or not sink._file.closed:
+        if sink.tmp_path is None:
             raise HTTPException(status_code=400, detail='No file selected')
+        if not sink.complete:
+            raise HTTPException(status_code=400, detail='Incomplete multipart body')
 
         compatible = sink.fields.get('compatible')
         activate = sink.fields.get('activate')
@@ -478,8 +490,27 @@ async def upload_bundle(request: Request):
 
         filename = sink.filename
         filepath = BUNDLES_DIR / filename
+        digest, size = sink.sha256, sink.size
+        # Commit: no await from here to the end of the block, so on the single event
+        # loop concurrent uploads of the same name can't interleave replace and
+        # manifest refresh. Keep it that way (or add a lock) when changing this.
         # Atomic: a failed or partial upload never clobbers a bundle being served.
         os.replace(sink.tmp_path, filepath)
+        refresh_manifests_for(filename, size, digest)
+        # Always persist compatible metadata when provided so Activate needs no prompt.
+        if resolved_compatible:
+            save_bundle_meta(filename, resolved_compatible)
+        if activate == 'true':
+            save_manifest(
+                {
+                    'bundle_url': manifest_bundle_url(filename),
+                    'filename': filename,
+                    'size': size,
+                    'sha256': digest,
+                    'released_at': datetime.now().isoformat(),
+                },
+                compatible=resolved_compatible,
+            )
     except ClientDisconnect:
         sink.discard()
         return Response(status_code=400)  # client is gone; nothing to report
@@ -489,25 +520,6 @@ async def upload_bundle(request: Request):
     except BaseException:
         sink.discard()
         raise
-
-    digest = sink.sha256
-    refresh_manifests_for(filename, filepath.stat().st_size, digest)
-
-    # Always persist compatible metadata when provided so Activate needs no prompt.
-    if resolved_compatible:
-        save_bundle_meta(filename, resolved_compatible)
-
-    if activate == 'true':
-        save_manifest(
-            {
-                'bundle_url': manifest_bundle_url(filename),
-                'filename': filename,
-                'size': filepath.stat().st_size,
-                'sha256': digest,
-                'released_at': datetime.now().isoformat(),
-            },
-            compatible=resolved_compatible,
-        )
 
     return RedirectResponse(url='/', status_code=303)
 
