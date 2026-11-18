@@ -42,6 +42,8 @@ State is plain files under `DATA_DIR` (`/data`), no database:
 
 - User-supplied filenames go through `secure_filename()`/`bundle_path()` (only `*.raucb` files that exist); keep new file routes behind them.
 - State-changing routes are protected only by the Origin-vs-Host middleware, since the dashboard has no auth. Don't expose `:8080` beyond localhost.
+- nginx is pinned by tag + digest in both compose files; bump both together (stable branch, digest from `skopeo inspect`), never back to a floating tag.
+- Bind mounts carry `z` so they work under SELinux (Fedora/podman); keep it on new mounts. In-flight uploads live in `/data/.tmp` (never under `bundles/`, which devices can fetch), and the dashboard accepts up to 2G (`client_max_body_size`).
 - Never mount `certs/` wholesale into containers; `ca.key` and device keys live there. nginx gets only `ca.crt`, `server.crt`, `server.key`.
 - `certs/`, `data/`, `.env` are gitignored. Keep LAN/VPS IPs and local paths out of committed files, and don't reference unreleased boards or projects; this repo is public.
 - Git: never commit to `main`; use `feat/…` or `fix/…` branches and PRs, squash-merged.
