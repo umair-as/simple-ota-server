@@ -18,6 +18,25 @@ services:
     depends_on:
       - app
     restart: unless-stopped
+    # Hardening: defence in depth for nginx2root (CVE-2026-123007, -123633, -118899).
+    # The master chowns its temp dirs and drops workers to the nginx user (CHOWN,
+    # SETUID, SETGID; removing any one stops nginx starting). DAC_OVERRIDE lets the
+    # root master read server.key (mode 600) when it belongs to the host user, as
+    # under rootful Docker. Not DAC_READ_SEARCH: that also unlocks open_by_handle_at
+    # in the default seccomp profile, which can read host files through bind mounts.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /tmp
 
   app:
     build: .
@@ -33,3 +52,14 @@ services:
       - ./static:/app/static:ro,z
       - ./boards.json:/app/boards.json:ro,z
     restart: unless-stopped
+    # The app runs as root and writes ./data. Under rootful Docker that belongs to
+    # the host user, so root needs DAC_OVERRIDE; every other capability is dropped.
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
